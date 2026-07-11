@@ -1,0 +1,15 @@
+[package]
+name = "overlord-collector"
+version = "0.1.0"
+edition = "2021"
+description = "Project Overlord fleet telemetry collector — receives read-only endpoint telemetry over HTTPS. No detection logic, no secrets in source."
+
+[dependencies]
+axum = { version = "0.8", features = ["json"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
