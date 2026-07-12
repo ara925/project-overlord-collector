@@ -183,20 +183,51 @@ async fn register_device(
         )
             .into_response();
     }
-    let device_token = random_device_token();
-    {
-        let mut registry = state.registry.lock().await;
-        registry.insert(machine_id.clone(), json!(device_token));
-        if let Some(parent) = state.registry_path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        let _ = std::fs::write(
-            &state.registry_path,
-            serde_json::to_string_pretty(&*registry).unwrap_or_default(),
-        );
+    // The tokio Mutex serializes concurrent registrations (no torn read-modify-write).
+    let mut registry = state.registry.lock().await;
+    if registry.contains_key(&machine_id) {
+        // An existing machine_id is NOT remotely re-registered with the shared secret alone — a
+        // leaked secret can't rotate a live machine's token to impersonate it. Recovery after a
+        // genuine registry reset still works (the id is unbound then), and an operator can clear an
+        // entry to re-enroll a reinstalled machine.
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "machine already enrolled",
+                "hint": "re-enrolling an existing machine requires an operator to reset its registry entry"
+            })),
+        )
+            .into_response();
     }
+    let device_token = random_device_token();
+    registry.insert(machine_id.clone(), json!(device_token.clone()));
+    // Persist atomically; on failure roll back the in-memory insert and report 500, so the endpoint
+    // never hands out a token that was not durably stored.
+    if let Err(error) = persist_registry(&state.registry_path, &registry) {
+        registry.remove(&machine_id);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to persist registration: {error}") })),
+        )
+            .into_response();
+    }
+    drop(registry);
     Json(json!({ "ok": true, "machine_id": machine_id, "device_token": device_token }))
         .into_response()
+}
+
+/// Persist the device registry atomically (temp file + rename) so a crash can't leave it torn.
+fn persist_registry(
+    path: &std::path::Path,
+    registry: &serde_json::Map<String, Value>,
+) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_string_pretty(registry).unwrap_or_default())?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 fn machine_id_of(body: &Value) -> String {
