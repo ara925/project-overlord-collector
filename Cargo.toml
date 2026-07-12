@@ -8,6 +8,7 @@ description = "Project Overlord fleet telemetry collector — receives read-only
 axum = { version = "0.8", features = ["json"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net"] }
 serde_json = "1"
+getrandom = "0.2"
 
 [profile.release]
 opt-level = "z"

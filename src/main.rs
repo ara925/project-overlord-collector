@@ -24,17 +24,24 @@ const SEEN_BATCH_CAP: usize = 200;
 
 #[derive(Clone)]
 struct AppState {
-    token: Arc<String>,
+    // The ENROLLMENT/operator secret (OVERLORD_INGEST_TOKEN). It authorizes device registration and
+    // the operator aggregate view — it is NOT accepted for telemetry ingest, which requires a
+    // per-device token so a leaked device credential can only speak for its own machine.
+    enroll_secret: Arc<String>,
     data_dir: PathBuf,
     // machine_id -> { received_at, digest } — latest detection digest per machine.
     digests: Arc<Mutex<serde_json::Map<String, Value>>>,
+    // machine_id -> device_token. TOFU: issued on first registration, then required for that
+    // machine's telemetry. Persisted to data_dir/device-registry.json.
+    registry: Arc<Mutex<serde_json::Map<String, Value>>>,
+    registry_path: PathBuf,
 }
 
 #[tokio::main]
 async fn main() {
     let token = std::env::var("OVERLORD_INGEST_TOKEN").unwrap_or_default();
     if token.is_empty() {
-        eprintln!("WARNING: OVERLORD_INGEST_TOKEN is not set — all ingest will be rejected (401).");
+        eprintln!("WARNING: OVERLORD_INGEST_TOKEN is not set — registration + aggregate will be rejected (401).");
     }
     // Render (and most platforms) inject the port to bind via $PORT.
     let port: u16 = std::env::var("PORT")
@@ -46,15 +53,24 @@ async fn main() {
     );
     let _ = std::fs::create_dir_all(data_dir.join("fleet-events"));
 
+    let registry_path = data_dir.join("device-registry.json");
+    let registry = std::fs::read_to_string(&registry_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(&text).ok())
+        .unwrap_or_default();
+
     let state = AppState {
-        token: Arc::new(token),
+        enroll_secret: Arc::new(token),
         data_dir,
         digests: Arc::new(Mutex::new(serde_json::Map::new())),
+        registry: Arc::new(Mutex::new(registry)),
+        registry_path,
     };
 
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
+        .route("/api/fleet/register", post(register_device))
         .route("/api/fleet/raw-telemetry", post(ingest_raw))
         .route(
             "/api/fleet/telemetry",
@@ -78,22 +94,109 @@ async fn health() -> Json<Value> {
     Json(json!({ "ok": true, "service": "overlord-collector" }))
 }
 
-/// Scoped ingest auth: X-Overlord-Ingest-Token must match the runtime token. Empty configured token
-/// rejects everything (fail closed).
-fn require_ingest_token(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
-    let provided = headers
+fn provided_ingest_token(headers: &HeaderMap) -> &str {
+    headers
         .get("X-Overlord-Ingest-Token")
         .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !state.token.is_empty() && provided == state.token.as_str() {
+        .unwrap_or_default()
+}
+
+/// Operator/enrollment auth: the shared secret. Guards registration + the aggregate view only.
+/// Empty configured secret rejects everything (fail closed).
+fn require_enroll_secret(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
+    if !state.enroll_secret.is_empty() && provided_ingest_token(headers) == state.enroll_secret.as_str() {
         Ok(())
     } else {
         Err((
             StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "missing or invalid X-Overlord-Ingest-Token" })),
+            Json(json!({ "error": "missing or invalid enrollment secret" })),
         )
             .into_response())
     }
+}
+
+/// Per-device telemetry auth: the provided token must equal the device token bound to `machine_id`
+/// at registration. A holder of one device's token therefore cannot speak for any other machine, and
+/// the shared enrollment secret alone is NOT accepted here.
+async fn require_device_token(
+    state: &AppState,
+    headers: &HeaderMap,
+    machine_id: &str,
+) -> Result<(), Response> {
+    let provided = provided_ingest_token(headers);
+    let registry = state.registry.lock().await;
+    let bound = registry.get(machine_id).and_then(Value::as_str).unwrap_or("");
+    if !bound.is_empty() && !provided.is_empty() && provided == bound {
+        Ok(())
+    } else {
+        Err((
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "unregistered machine or invalid device token",
+                "hint": "POST /api/fleet/register with the enrollment secret to obtain a per-device token"
+            })),
+        )
+            .into_response())
+    }
+}
+
+/// Unpredictable per-device token from OS entropy (falls back to a fixed-length label on the
+/// vanishingly rare entropy failure, which still passes through registration binding).
+fn random_device_token() -> String {
+    let mut bytes = [0u8; 24];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        // Entropy unavailable — mix the machine map length in so we don't emit a constant.
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+    }
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    format!("ovldev-{hex}")
+}
+
+/// TOFU device registration: with the enrollment secret, a machine claims its `machine_id` and gets
+/// a per-device token (rotated on re-registration, e.g. after a reinstall). That token is what its
+/// telemetry must then present. This is not full attestation — a secret holder can still register a
+/// fresh id — but it scopes the day-to-day telemetry credential per machine.
+async fn register_device(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    // The enrollment secret may arrive in the header or the body (the reporter sends it in the body).
+    let body_secret = body.get("enroll_token").and_then(Value::as_str).unwrap_or("");
+    let header_ok = require_enroll_secret(&state, &headers).is_ok();
+    let secret_ok = header_ok
+        || (!state.enroll_secret.is_empty() && body_secret == state.enroll_secret.as_str());
+    if !secret_ok {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid enrollment secret" })),
+        )
+            .into_response();
+    }
+    let machine_id = machine_id_of(&body);
+    if machine_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "machine_id is required" })),
+        )
+            .into_response();
+    }
+    let device_token = random_device_token();
+    {
+        let mut registry = state.registry.lock().await;
+        registry.insert(machine_id.clone(), json!(device_token));
+        if let Some(parent) = state.registry_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(
+            &state.registry_path,
+            serde_json::to_string_pretty(&*registry).unwrap_or_default(),
+        );
+    }
+    Json(json!({ "ok": true, "machine_id": machine_id, "device_token": device_token }))
+        .into_response()
 }
 
 fn machine_id_of(body: &Value) -> String {
@@ -170,9 +273,6 @@ async fn ingest_raw(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if let Err(response) = require_ingest_token(&state, &headers) {
-        return response;
-    }
     let machine_id = machine_id_of(&body);
     if machine_id.is_empty() {
         return (
@@ -180,6 +280,9 @@ async fn ingest_raw(
             Json(json!({ "error": "machine_id is required" })),
         )
             .into_response();
+    }
+    if let Err(response) = require_device_token(&state, &headers, &machine_id).await {
+        return response;
     }
     let name = safe_name(&machine_id);
     let batch_id = body.get("batch_id").and_then(Value::as_str).unwrap_or("");
@@ -207,9 +310,6 @@ async fn ingest_digest(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    if let Err(response) = require_ingest_token(&state, &headers) {
-        return response;
-    }
     let machine_id = machine_id_of(&body);
     if machine_id.is_empty() {
         return (
@@ -217,6 +317,9 @@ async fn ingest_digest(
             Json(json!({ "error": "machine_id is required" })),
         )
             .into_response();
+    }
+    if let Err(response) = require_device_token(&state, &headers, &machine_id).await {
+        return response;
     }
     let digest = body.get("digest").cloned().unwrap_or(Value::Null);
     let mut digests = state.digests.lock().await;
@@ -230,7 +333,7 @@ async fn ingest_digest(
 
 /// Operator view (also token-guarded): fleet-wide rollup of the latest per-machine digests.
 async fn aggregate(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
-    if let Err(response) = require_ingest_token(&state, &headers) {
+    if let Err(response) = require_enroll_secret(&state, &headers) {
         return response;
     }
     let digests = state.digests.lock().await;
