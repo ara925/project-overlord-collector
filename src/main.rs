@@ -76,6 +76,9 @@ async fn main() {
             "/api/fleet/telemetry",
             post(ingest_digest).get(aggregate),
         )
+        // Broad raw telemetry envelopes exceed axum's 2MB default; endpoints already cap each
+        // envelope well under this, so 16MB is comfortable headroom.
+        .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
