@@ -70,7 +70,16 @@ async fn main() {
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
-        .route("/api/fleet/register", post(register_device))
+        // Registration / recovery-bind bodies are tiny — cap them tightly so they can't be abused
+        // as a large-body vector, while raw telemetry keeps the generous allowance below.
+        .route(
+            "/api/fleet/register",
+            post(register_device).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/fleet/recovery-bind",
+            post(recovery_bind).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
+        )
         .route("/api/fleet/raw-telemetry", post(ingest_raw))
         .route(
             "/api/fleet/telemetry",
@@ -128,7 +137,10 @@ async fn require_device_token(
 ) -> Result<(), Response> {
     let provided = provided_ingest_token(headers);
     let registry = state.registry.lock().await;
-    let bound = registry.get(machine_id).and_then(Value::as_str).unwrap_or("");
+    let bound = registry
+        .get(machine_id)
+        .and_then(entry_device_token)
+        .unwrap_or_default();
     if !bound.is_empty() && !provided.is_empty() && provided == bound {
         Ok(())
     } else {
@@ -141,6 +153,30 @@ async fn require_device_token(
         )
             .into_response())
     }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A registry entry is either a legacy raw token string, or `{ token, recovery_hash }`. Extract the
+/// device token from either shape so old entries keep working after the format change.
+fn entry_device_token(entry: &Value) -> Option<String> {
+    entry
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| entry.get("token").and_then(Value::as_str).map(str::to_string))
+}
+
+/// A recovery token bounds a lost-device-token recovery. Only the SHA-256 of the recovery secret is
+/// ever stored — never the secret itself. Accepts the `ovlrec-` prefix, length-bounded.
+fn recovery_hash_of(recovery_token: Option<&str>) -> Option<String> {
+    recovery_token
+        .filter(|token| token.starts_with("ovlrec-") && token.len() <= 128)
+        .map(|token| sha256_hex(token.as_bytes()))
 }
 
 /// Unpredictable per-device token from OS entropy (falls back to a fixed-length label on the
@@ -179,31 +215,50 @@ async fn register_device(
             .into_response();
     }
     let machine_id = machine_id_of(&body);
-    if machine_id.is_empty() {
+    if machine_id.is_empty() || machine_id.len() > 128 {
         return (
             StatusCode::BAD_REQUEST,
-            Json(json!({ "error": "machine_id is required" })),
+            Json(json!({ "error": "machine_id is required and must be <= 128 chars" })),
         )
             .into_response();
     }
+    let recovery_hash = recovery_hash_of(body.get("recovery_token").and_then(Value::as_str));
     // The tokio Mutex serializes concurrent registrations (no torn read-modify-write).
     let mut registry = state.registry.lock().await;
-    if registry.contains_key(&machine_id) {
-        // An existing machine_id is NOT remotely re-registered with the shared secret alone — a
-        // leaked secret can't rotate a live machine's token to impersonate it. Recovery after a
-        // genuine registry reset still works (the id is unbound then), and an operator can clear an
-        // entry to re-enroll a reinstalled machine.
+    if let Some(existing) = registry.get(&machine_id) {
+        // Existing machine: return the SAME token ONLY when the caller proves the recovery secret
+        // (its hash matches what was stored). A shared-secret holder WITHOUT that proof cannot rotate
+        // or read another live machine's token — it gets 409. Recovery after a genuine registry reset
+        // still works (the id is unbound then).
+        let token = entry_device_token(existing);
+        let stored_hash = existing.get("recovery_hash").and_then(Value::as_str);
+        if let (Some(token), Some(provided), Some(stored)) =
+            (token, recovery_hash.as_deref(), stored_hash)
+        {
+            if provided == stored {
+                return Json(json!({
+                    "ok": true,
+                    "machine_id": machine_id,
+                    "device_token": token,
+                    "registration": "recovered"
+                }))
+                .into_response();
+            }
+        }
         return (
             StatusCode::CONFLICT,
             Json(json!({
                 "error": "machine already enrolled",
-                "hint": "re-enrolling an existing machine requires an operator to reset its registry entry"
+                "hint": "re-enrolling an existing machine requires its recovery proof or an operator reset"
             })),
         )
             .into_response();
     }
     let device_token = random_device_token();
-    registry.insert(machine_id.clone(), json!(device_token.clone()));
+    registry.insert(
+        machine_id.clone(),
+        json!({ "token": device_token, "recovery_hash": recovery_hash }),
+    );
     // Persist atomically; on failure roll back the in-memory insert and report 500, so the endpoint
     // never hands out a token that was not durably stored.
     if let Err(error) = persist_registry(&state.registry_path, &registry) {
@@ -215,8 +270,72 @@ async fn register_device(
             .into_response();
     }
     drop(registry);
-    Json(json!({ "ok": true, "machine_id": machine_id, "device_token": device_token }))
-        .into_response()
+    Json(json!({
+        "ok": true,
+        "machine_id": machine_id,
+        "device_token": device_token,
+        "registration": "new"
+    }))
+    .into_response()
+}
+
+/// Bind (or refresh) a recovery proof for an already-registered machine. Authenticated with the
+/// machine's CURRENT device token — the shared enrollment secret alone cannot bind recovery material.
+/// Only the SHA-256 of the recovery secret is stored.
+async fn recovery_bind(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> impl IntoResponse {
+    let machine_id = machine_id_of(&body);
+    if machine_id.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "machine_id is required" })),
+        )
+            .into_response();
+    }
+    if let Err(response) = require_device_token(&state, &headers, &machine_id).await {
+        return response;
+    }
+    let recovery_hash = match recovery_hash_of(body.get("recovery_token").and_then(Value::as_str)) {
+        Some(hash) => hash,
+        None => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid recovery token" })),
+            )
+                .into_response()
+        }
+    };
+    let mut registry = state.registry.lock().await;
+    let Some(existing) = registry.get(&machine_id).cloned() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "machine is not registered" })),
+        )
+            .into_response();
+    };
+    let Some(token) = entry_device_token(&existing) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "device token missing" })),
+        )
+            .into_response();
+    };
+    registry.insert(
+        machine_id.clone(),
+        json!({ "token": token, "recovery_hash": recovery_hash }),
+    );
+    if let Err(error) = persist_registry(&state.registry_path, &registry) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("failed to persist recovery binding: {error}") })),
+        )
+            .into_response();
+    }
+    drop(registry);
+    Json(json!({ "ok": true, "machine_id": machine_id, "recovery": "bound" })).into_response()
 }
 
 /// Persist the device registry atomically (temp file + rename) so a crash can't leave it torn.
