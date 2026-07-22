@@ -48,9 +48,8 @@ async fn main() {
         .ok()
         .and_then(|p| p.trim().parse().ok())
         .unwrap_or(8787);
-    let data_dir = PathBuf::from(
-        std::env::var("OVERLORD_DATA_DIR").unwrap_or_else(|_| "./data".to_string()),
-    );
+    let data_dir =
+        PathBuf::from(std::env::var("OVERLORD_DATA_DIR").unwrap_or_else(|_| "./data".to_string()));
     let _ = std::fs::create_dir_all(data_dir.join("fleet-events"));
 
     let registry_path = data_dir.join("device-registry.json");
@@ -81,10 +80,9 @@ async fn main() {
             post(recovery_bind).layer(axum::extract::DefaultBodyLimit::max(16 * 1024)),
         )
         .route("/api/fleet/raw-telemetry", post(ingest_raw))
-        .route(
-            "/api/fleet/telemetry",
-            post(ingest_digest).get(aggregate),
-        )
+        .route("/upload", post(ingest_field_bundle))
+        .route("/api/field-telemetry", get(field_telemetry_aggregate))
+        .route("/api/fleet/telemetry", post(ingest_digest).get(aggregate))
         // Broad raw telemetry envelopes exceed axum's 2MB default; endpoints already cap each
         // envelope well under this, so 16MB is comfortable headroom.
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
@@ -113,10 +111,19 @@ fn provided_ingest_token(headers: &HeaderMap) -> &str {
         .unwrap_or_default()
 }
 
+fn provided_field_key(headers: &HeaderMap) -> &str {
+    headers
+        .get("X-Overlord-Field-Key")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+}
+
 /// Operator/enrollment auth: the shared secret. Guards registration + the aggregate view only.
 /// Empty configured secret rejects everything (fail closed).
 fn require_enroll_secret(state: &AppState, headers: &HeaderMap) -> Result<(), Response> {
-    if !state.enroll_secret.is_empty() && provided_ingest_token(headers) == state.enroll_secret.as_str() {
+    if !state.enroll_secret.is_empty()
+        && provided_ingest_token(headers) == state.enroll_secret.as_str()
+    {
         Ok(())
     } else {
         Err((
@@ -159,16 +166,22 @@ fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    hasher.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// A registry entry is either a legacy raw token string, or `{ token, recovery_hash }`. Extract the
 /// device token from either shape so old entries keep working after the format change.
 fn entry_device_token(entry: &Value) -> Option<String> {
-    entry
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| entry.get("token").and_then(Value::as_str).map(str::to_string))
+    entry.as_str().map(str::to_string).or_else(|| {
+        entry
+            .get("token")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 /// A recovery token bounds a lost-device-token recovery. Only the SHA-256 of the recovery secret is
@@ -203,7 +216,10 @@ async fn register_device(
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
     // The enrollment secret may arrive in the header or the body (the reporter sends it in the body).
-    let body_secret = body.get("enroll_token").and_then(Value::as_str).unwrap_or("");
+    let body_secret = body
+        .get("enroll_token")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let header_ok = require_enroll_secret(&state, &headers).is_ok();
     let secret_ok = header_ok
         || (!state.enroll_secret.is_empty() && body_secret == state.enroll_secret.as_str());
@@ -347,7 +363,10 @@ fn persist_registry(
         std::fs::create_dir_all(parent)?;
     }
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, serde_json::to_string_pretty(registry).unwrap_or_default())?;
+    std::fs::write(
+        &tmp,
+        serde_json::to_string_pretty(registry).unwrap_or_default(),
+    )?;
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -396,17 +415,212 @@ fn append_capped(path: &std::path::Path, line: &str, max_bytes: u64) -> std::io:
     writeln!(file, "{line}")
 }
 
-/// Hub-side dedupe: has this batch id already been recorded for the machine? Bounded `.seen` ring.
+fn write_json_atomic(path: &std::path::Path, value: &Value) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, serde_json::to_vec_pretty(value).unwrap_or_default())?;
+    std::fs::rename(tmp, path)
+}
+
+fn redact_sensitive_value(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            for (key, child) in map.iter_mut() {
+                let lower = key.to_ascii_lowercase();
+                let is_status_flag = matches!(
+                    lower.as_str(),
+                    "raw_secret_returned"
+                        | "automatic_upload_configured"
+                        | "automatic_upload_performed"
+                        | "ingest_key_configured"
+                );
+                if !is_status_flag
+                    && (lower.contains("token")
+                        || lower.contains("secret")
+                        || lower.contains("password")
+                        || lower.contains("api_key")
+                        || lower.contains("credential")
+                        || lower.contains("private_key")
+                        || lower.contains("bearer"))
+                {
+                    *child = Value::String("[redacted]".to_string());
+                } else {
+                    redact_sensitive_value(child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_sensitive_value(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Receive the bounded, redacted desktop field bundle. This endpoint exists independently from
+/// fleet enrollment so a renderer failure can still report its startup log on first launch.
+async fn ingest_field_bundle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<Value>,
+) -> impl IntoResponse {
+    if state.enroll_secret.is_empty()
+        || provided_field_key(&headers) != state.enroll_secret.as_str()
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({ "error": "missing or invalid field key" })),
+        )
+            .into_response();
+    }
+    let submission_id = body
+        .get("submission_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let header_submission_id = headers
+        .get("X-Overlord-Submission-Id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .trim();
+    if submission_id.is_empty()
+        || submission_id.len() > 128
+        || submission_id != header_submission_id
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "invalid or mismatched submission id" })),
+        )
+            .into_response();
+    }
+    let participant = body
+        .get("participant_id")
+        .and_then(Value::as_str)
+        .unwrap_or("unassigned")
+        .trim()
+        .to_string();
+    if participant.is_empty() || participant.len() > 128 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "participant id must be 1..128 characters" })),
+        )
+            .into_response();
+    }
+    let name = safe_name(&participant);
+    redact_sensitive_value(&mut body);
+    let dir = state.data_dir.join("field-events");
+    let seen_path = dir.join(format!("{name}.seen"));
+    if batch_already_seen(&seen_path, &submission_id) {
+        return Json(json!({
+            "ok": true,
+            "saved": true,
+            "deduped": true,
+            "submission_id": submission_id,
+            "raw_secret_returned": false
+        }))
+        .into_response();
+    }
+    let received_at = chrono::Utc::now().to_rfc3339();
+    let envelope = json!({
+        "participant_id": participant,
+        "submission_id": submission_id,
+        "received_at": received_at,
+        "bundle": body
+    });
+    let line = serde_json::to_string(&envelope).unwrap_or_default();
+    let history_path = dir.join(format!("{name}.jsonl"));
+    let latest_path = dir.join(format!("{name}.latest.json"));
+    if let Err(error) = append_capped(&history_path, &line, RAW_LOG_MAX_BYTES)
+        .and_then(|_| write_json_atomic(&latest_path, &envelope))
+    {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": error.to_string() })),
+        )
+            .into_response();
+    }
+    remember_batch(&seen_path, &submission_id);
+    Json(json!({
+        "ok": true,
+        "saved": true,
+        "deduped": false,
+        "submission_id": submission_id,
+        "received_at": received_at,
+        "raw_secret_returned": false
+    }))
+    .into_response()
+}
+
+async fn field_telemetry_aggregate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_enroll_secret(&state, &headers) {
+        return response;
+    }
+    let dir = state.data_dir.join("field-events");
+    let mut participants = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".latest.json")
+            {
+                continue;
+            }
+            if let Ok(text) = std::fs::read_to_string(entry.path()) {
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    participants.push(value);
+                }
+            }
+        }
+    }
+    participants.sort_by(|left, right| {
+        let left = left
+            .get("received_at")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let right = right
+            .get("received_at")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        right.cmp(left)
+    });
+    Json(json!({
+        "read_only": true,
+        "participants_reporting": participants.len(),
+        "participants": participants,
+        "raw_secret_returned": false
+    }))
+    .into_response()
+}
+
 fn batch_already_seen(path: &std::path::Path, batch_id: &str) -> bool {
     if batch_id.is_empty() {
         return false;
+    }
+    std::fs::read_to_string(path)
+        .ok()
+        .is_some_and(|text| text.lines().any(|id| id == batch_id))
+}
+
+/// Record dedupe only after durable storage succeeds. Advancing it before the write would turn a
+/// transient disk error into permanent telemetry loss on the sender's retry.
+fn remember_batch(path: &std::path::Path, batch_id: &str) {
+    if batch_id.is_empty() {
+        return;
     }
     let mut seen: Vec<String> = std::fs::read_to_string(path)
         .ok()
         .map(|text| text.lines().map(str::to_string).collect())
         .unwrap_or_default();
     if seen.iter().any(|id| id == batch_id) {
-        return true;
+        return;
     }
     seen.push(batch_id.to_string());
     if seen.len() > SEEN_BATCH_CAP {
@@ -417,7 +631,6 @@ fn batch_already_seen(path: &std::path::Path, batch_id: &str) -> bool {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(path, seen.join("\n"));
-    false
 }
 
 /// Broad raw activity: append the envelope to the machine's log, deduping resends.
@@ -439,16 +652,25 @@ async fn ingest_raw(
     }
     let name = safe_name(&machine_id);
     let batch_id = body.get("batch_id").and_then(Value::as_str).unwrap_or("");
-    let seen_path = state.data_dir.join("fleet-events").join(format!("{name}.seen"));
+    let seen_path = state
+        .data_dir
+        .join("fleet-events")
+        .join(format!("{name}.seen"));
     if batch_already_seen(&seen_path, batch_id) {
         return Json(json!({ "ok": true, "machine_id": machine_id, "stored": "deduped" }))
             .into_response();
     }
-    let log_path = state.data_dir.join("fleet-events").join(format!("{name}.jsonl"));
+    let log_path = state
+        .data_dir
+        .join("fleet-events")
+        .join(format!("{name}.jsonl"));
     let line = serde_json::to_string(&body).unwrap_or_default();
     match append_capped(&log_path, &line, RAW_LOG_MAX_BYTES) {
-        Ok(()) => Json(json!({ "ok": true, "machine_id": machine_id, "stored": "appended" }))
-            .into_response(),
+        Ok(()) => {
+            remember_batch(&seen_path, batch_id);
+            Json(json!({ "ok": true, "machine_id": machine_id, "stored": "appended" }))
+                .into_response()
+        }
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": error.to_string() })),
