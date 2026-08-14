@@ -6,7 +6,7 @@
 //! ever records observations posted to it; it never sends anything back that could act on a machine.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -31,6 +31,11 @@ struct AppState {
     data_dir: PathBuf,
     // machine_id -> { received_at, digest } — latest detection digest per machine.
     digests: Arc<Mutex<serde_json::Map<String, Value>>>,
+    digest_path: PathBuf,
+    // A bounded latest raw-heartbeat summary per machine. Full raw activity remains in the
+    // append-only journal and is never returned by the operator summary endpoints.
+    raw_summaries: Arc<Mutex<serde_json::Map<String, Value>>>,
+    raw_summary_path: PathBuf,
     // machine_id -> device_token. TOFU: issued on first registration, then required for that
     // machine's telemetry. Persisted to data_dir/device-registry.json.
     registry: Arc<Mutex<serde_json::Map<String, Value>>>,
@@ -58,10 +63,17 @@ async fn main() {
         .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(&text).ok())
         .unwrap_or_default();
 
+    let digest_path = data_dir.join("fleet-latest-digests.json");
+    let raw_summary_path = data_dir.join("fleet-latest-raw-summaries.json");
+    let digests = load_json_map(&digest_path);
+    let raw_summaries = load_json_map(&raw_summary_path);
     let state = AppState {
         enroll_secret: Arc::new(token),
         data_dir,
-        digests: Arc::new(Mutex::new(serde_json::Map::new())),
+        digests: Arc::new(Mutex::new(digests)),
+        digest_path,
+        raw_summaries: Arc::new(Mutex::new(raw_summaries)),
+        raw_summary_path,
         registry: Arc::new(Mutex::new(registry)),
         registry_path,
     };
@@ -83,6 +95,12 @@ async fn main() {
         .route("/upload", post(ingest_field_bundle))
         .route("/api/field-telemetry", get(field_telemetry_aggregate))
         .route("/api/fleet/telemetry", post(ingest_digest).get(aggregate))
+        .route("/api/fleet/machines", get(machine_list))
+        .route("/api/fleet/machines/{machine_id}", get(machine_detail))
+        .route(
+            "/api/fleet/machines/{machine_id}/timeline",
+            get(machine_timeline),
+        )
         // Broad raw telemetry envelopes exceed axum's 2MB default; endpoints already cap each
         // envelope well under this, so 16MB is comfortable headroom.
         .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024))
@@ -424,6 +442,20 @@ fn write_json_atomic(path: &std::path::Path, value: &Value) -> std::io::Result<(
     std::fs::rename(tmp, path)
 }
 
+fn load_json_map(path: &std::path::Path) -> serde_json::Map<String, Value> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Map<String, Value>>(&text).ok())
+        .unwrap_or_default()
+}
+
+fn write_json_map_atomic(
+    path: &std::path::Path,
+    map: &serde_json::Map<String, Value>,
+) -> std::io::Result<()> {
+    write_json_atomic(path, &Value::Object(map.clone()))
+}
+
 fn redact_sensitive_value(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -633,6 +665,38 @@ fn remember_batch(path: &std::path::Path, batch_id: &str) {
     let _ = std::fs::write(path, seen.join("\n"));
 }
 
+fn raw_heartbeat_summary(body: &Value, received_at: &str) -> Value {
+    let section_count = |name: &str| {
+        body.pointer(&format!("/sections/{name}/records"))
+            .and_then(Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0)
+    };
+    let mut summary = json!({
+        "machine_id": machine_id_of(body),
+        "received_at": received_at,
+        "collected_at": body.get("collected_at").cloned().unwrap_or(Value::Null),
+        "batch_id": body.get("batch_id").cloned().unwrap_or(Value::Null),
+        "schema": body.get("schema").cloned().unwrap_or(Value::Null),
+        "provenance": body.get("provenance").cloned().unwrap_or(Value::Null),
+        "heartbeat": body.get("heartbeat").cloned().unwrap_or(Value::Null),
+        "telemetry_gap": body.get("telemetry_gap").cloned().unwrap_or(Value::Null),
+        "section_counts": {
+            "processes": section_count("processes"),
+            "network_connections": section_count("network_connections"),
+            "runtime_scripts": section_count("runtime_scripts"),
+            "dns_cache": section_count("dns_cache"),
+            "process_events": section_count("process_events")
+        },
+        "read_only": true,
+        "hands_tied": true,
+        "raw_activity_returned": false,
+        "raw_secret_returned": false
+    });
+    redact_sensitive_value(&mut summary);
+    summary
+}
+
 /// Broad raw activity: append the envelope to the machine's log, deduping resends.
 async fn ingest_raw(
     State(state): State<AppState>,
@@ -664,6 +728,19 @@ async fn ingest_raw(
         .data_dir
         .join("fleet-events")
         .join(format!("{name}.jsonl"));
+    let received_at = chrono::Utc::now().to_rfc3339();
+    let summary = raw_heartbeat_summary(&body, &received_at);
+    {
+        let mut summaries = state.raw_summaries.lock().await;
+        summaries.insert(machine_id.clone(), summary);
+        if let Err(error) = write_json_map_atomic(&state.raw_summary_path, &summaries) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("could not persist latest machine heartbeat: {error}") })),
+            )
+                .into_response();
+        }
+    }
     let line = serde_json::to_string(&body).unwrap_or_default();
     match append_capped(&log_path, &line, RAW_LOG_MAX_BYTES) {
         Ok(()) => {
@@ -696,12 +773,21 @@ async fn ingest_digest(
     if let Err(response) = require_device_token(&state, &headers, &machine_id).await {
         return response;
     }
-    let digest = body.get("digest").cloned().unwrap_or(Value::Null);
+    let mut digest = body.get("digest").cloned().unwrap_or(Value::Null);
+    redact_sensitive_value(&mut digest);
+    let received_at = chrono::Utc::now().to_rfc3339();
     let mut digests = state.digests.lock().await;
     digests.insert(
         machine_id.clone(),
-        json!({ "machine_id": machine_id, "digest": digest }),
+        json!({ "machine_id": machine_id, "received_at": received_at, "digest": digest }),
     );
+    if let Err(error) = write_json_map_atomic(&state.digest_path, &digests) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": format!("could not persist latest machine digest: {error}") })),
+        )
+            .into_response();
+    }
     Json(json!({ "ok": true, "machine_id": machine_id, "machines_reporting": digests.len() }))
         .into_response()
 }
@@ -733,4 +819,239 @@ async fn aggregate(State(state): State<AppState>, headers: HeaderMap) -> impl In
         "machines": machines
     }))
     .into_response()
+}
+
+fn machine_summary_value(
+    machine_id: &str,
+    digest_entry: Option<&Value>,
+    raw_summary: Option<&Value>,
+) -> Value {
+    let digest = digest_entry
+        .and_then(|entry| entry.get("digest"))
+        .unwrap_or(&Value::Null);
+    let digest_seen = digest_entry
+        .and_then(|entry| entry.get("received_at"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let raw_seen = raw_summary
+        .and_then(|entry| entry.get("received_at"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let last_seen = if digest_seen >= raw_seen {
+        digest_seen
+    } else {
+        raw_seen
+    };
+    let from_digest_or_raw = |digest_pointer: &str, raw_pointer: &str| {
+        digest
+            .pointer(digest_pointer)
+            .cloned()
+            .or_else(|| {
+                raw_summary
+                    .and_then(|entry| entry.pointer(raw_pointer))
+                    .cloned()
+            })
+            .unwrap_or(Value::Null)
+    };
+    let lifecycle = from_digest_or_raw("/lifecycle", "/heartbeat/lifecycle");
+    let mut value = json!({
+        "machine_id": machine_id,
+        "display_name": from_digest_or_raw("/machine/display_name", "/heartbeat/display_name"),
+        "last_seen_at": last_seen,
+        "provenance": from_digest_or_raw("/provenance", "/provenance"),
+        "runtime": from_digest_or_raw("/runtime", "/heartbeat"),
+        "latest_scan": from_digest_or_raw("/latest_scan", "/heartbeat/latest_scan"),
+        "update": from_digest_or_raw("/update", "/heartbeat/update"),
+        "lifecycle": lifecycle,
+        "verdicts": digest.get("verdicts").cloned().unwrap_or(Value::Null),
+        "flags_total": digest.get("flags_total").cloned().unwrap_or(json!(0)),
+        "coverage": digest.get("coverage").cloned().unwrap_or(Value::Null),
+        "data_quality": digest.get("data_quality").cloned().unwrap_or(Value::Null),
+        "section_counts": raw_summary
+            .and_then(|entry| entry.get("section_counts"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "telemetry_gap": raw_summary
+            .and_then(|entry| entry.get("telemetry_gap"))
+            .cloned()
+            .unwrap_or(Value::Null),
+        "read_only": true,
+        "hands_tied": true,
+        "remote_commands_enabled": false,
+        "raw_activity_returned": false,
+        "raw_secret_returned": false
+    });
+    redact_sensitive_value(&mut value);
+    value
+}
+
+fn machine_summaries(
+    digests: &serde_json::Map<String, Value>,
+    raw_summaries: &serde_json::Map<String, Value>,
+) -> Vec<Value> {
+    let mut ids = digests
+        .keys()
+        .chain(raw_summaries.keys())
+        .cloned()
+        .collect::<Vec<_>>();
+    ids.sort();
+    ids.dedup();
+    let mut machines = ids
+        .iter()
+        .map(|machine_id| {
+            machine_summary_value(
+                machine_id,
+                digests.get(machine_id),
+                raw_summaries.get(machine_id),
+            )
+        })
+        .collect::<Vec<_>>();
+    machines.sort_by(|left, right| {
+        right
+            .get("last_seen_at")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(
+                left.get("last_seen_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""),
+            )
+    });
+    machines
+}
+
+async fn machine_list(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if let Err(response) = require_enroll_secret(&state, &headers) {
+        return response;
+    }
+    let digests = state.digests.lock().await;
+    let raw_summaries = state.raw_summaries.lock().await;
+    let machines = machine_summaries(&digests, &raw_summaries);
+    Json(json!({
+        "schema": "overlord.fleet.machine-list.v1",
+        "machines_reporting": machines.len(),
+        "machines": machines,
+        "generated_at": chrono::Utc::now().to_rfc3339(),
+        "read_only": true,
+        "hands_tied": true,
+        "remote_commands_enabled": false,
+        "raw_secret_returned": false
+    }))
+    .into_response()
+}
+
+async fn machine_detail(
+    State(state): State<AppState>,
+    Path(machine_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_enroll_secret(&state, &headers) {
+        return response;
+    }
+    let digests = state.digests.lock().await;
+    let raw_summaries = state.raw_summaries.lock().await;
+    if !digests.contains_key(&machine_id) && !raw_summaries.contains_key(&machine_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "machine not found" })),
+        )
+            .into_response();
+    }
+    Json(machine_summary_value(
+        &machine_id,
+        digests.get(&machine_id),
+        raw_summaries.get(&machine_id),
+    ))
+    .into_response()
+}
+
+async fn machine_timeline(
+    State(state): State<AppState>,
+    Path(machine_id): Path<String>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(response) = require_enroll_secret(&state, &headers) {
+        return response;
+    }
+    let digests = state.digests.lock().await;
+    let raw_summaries = state.raw_summaries.lock().await;
+    if !digests.contains_key(&machine_id) && !raw_summaries.contains_key(&machine_id) {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "machine not found" })),
+        )
+            .into_response();
+    }
+    let summary = machine_summary_value(
+        &machine_id,
+        digests.get(&machine_id),
+        raw_summaries.get(&machine_id),
+    );
+    let events = summary
+        .pointer("/lifecycle/recent")
+        .or_else(|| summary.get("lifecycle").filter(|value| value.is_array()))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    Json(json!({
+        "schema": "overlord.fleet.machine-timeline.v1",
+        "machine_id": machine_id,
+        "events": events,
+        "read_only": true,
+        "hands_tied": true,
+        "raw_secret_returned": false
+    }))
+    .into_response()
+}
+
+#[cfg(test)]
+mod observability_tests {
+    use super::*;
+
+    #[test]
+    fn raw_summary_keeps_heartbeat_but_not_raw_records() {
+        let input = json!({
+            "machine_id": "machine-1",
+            "batch_id": "batch-1",
+            "provenance": { "version": "0.2.25" },
+            "heartbeat": { "display_name": "FIELD-PC", "hands_tied": true },
+            "sections": {
+                "processes": { "records": [{ "command": "private" }] },
+                "network_connections": { "records": [1, 2] }
+            }
+        });
+        let summary = raw_heartbeat_summary(&input, "2026-08-15T12:00:00Z");
+        assert_eq!(
+            summary.pointer("/section_counts/processes"),
+            Some(&json!(1))
+        );
+        assert_eq!(
+            summary.pointer("/section_counts/network_connections"),
+            Some(&json!(2))
+        );
+        assert!(summary.get("sections").is_none());
+        assert_eq!(summary.pointer("/heartbeat/hands_tied"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn machine_summary_is_read_only_and_resolves_version_and_update() {
+        let digest = json!({
+            "machine_id": "machine-1",
+            "received_at": "2026-08-15T12:00:01Z",
+            "digest": {
+                "machine": { "display_name": "FIELD-PC" },
+                "provenance": { "version": "0.2.25" },
+                "update": { "status": "succeeded" },
+                "verdicts": { "malicious": 0 }
+            }
+        });
+        let summary = machine_summary_value("machine-1", Some(&digest), None);
+        assert_eq!(summary.get("display_name"), Some(&json!("FIELD-PC")));
+        assert_eq!(
+            summary.pointer("/provenance/version"),
+            Some(&json!("0.2.25"))
+        );
+        assert_eq!(summary.pointer("/update/status"), Some(&json!("succeeded")));
+        assert_eq!(summary.get("hands_tied"), Some(&json!(true)));
+        assert_eq!(summary.get("remote_commands_enabled"), Some(&json!(false)));
+    }
 }

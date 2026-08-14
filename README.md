@@ -8,6 +8,13 @@ It only records observations posted to it. Nothing it returns can act on any mac
 
 ## Endpoints
 
+The operator-facing machine ledger is durable across collector restarts and returns only bounded
+heartbeat summaries. It never returns full raw activity or any credential material.
+
+- `GET /api/fleet/machines` - list reporting machines with build, runtime, scan, update, and delivery state.
+- `GET /api/fleet/machines/{machine_id}` - retrieve one machine's latest bounded heartbeat.
+- `GET /api/fleet/machines/{machine_id}/timeline` - retrieve its bounded desktop lifecycle timeline.
+
 - `GET /health` — liveness.
 - `POST /api/fleet/raw-telemetry` — append the machine's raw activity envelope (deduped by `batch_id`).
 - `POST /api/fleet/telemetry` — store the machine's latest detection digest.
