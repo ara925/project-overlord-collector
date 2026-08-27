@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 
 const RAW_LOG_MAX_BYTES: u64 = 50 * 1024 * 1024;
 const SEEN_BATCH_CAP: usize = 200;
+const MACHINE_ONLINE_WINDOW_SECONDS: i64 = 5 * 60;
 
 #[derive(Clone)]
 struct AppState {
@@ -40,6 +41,14 @@ struct AppState {
     // machine's telemetry. Persisted to data_dir/device-registry.json.
     registry: Arc<Mutex<serde_json::Map<String, Value>>>,
     registry_path: PathBuf,
+    storage_readiness: StorageReadiness,
+}
+
+#[derive(Clone)]
+struct StorageReadiness {
+    data_dir_explicit: bool,
+    persistent_storage_declared: bool,
+    data_dir_ready: bool,
 }
 
 #[tokio::main]
@@ -53,9 +62,27 @@ async fn main() {
         .ok()
         .and_then(|p| p.trim().parse().ok())
         .unwrap_or(8787);
-    let data_dir =
-        PathBuf::from(std::env::var("OVERLORD_DATA_DIR").unwrap_or_else(|_| "./data".to_string()));
-    let _ = std::fs::create_dir_all(data_dir.join("fleet-events"));
+    let configured_data_dir = std::env::var("OVERLORD_DATA_DIR")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let data_dir_explicit = configured_data_dir.is_some();
+    let data_dir = PathBuf::from(configured_data_dir.unwrap_or_else(|| "./data".to_string()));
+    let persistent_storage_declared = std::env::var("OVERLORD_PERSISTENT_STORAGE")
+        .ok()
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes"
+            )
+        });
+    let data_dir_ready = std::fs::create_dir_all(data_dir.join("fleet-events")).is_ok();
+    if !data_dir_ready {
+        eprintln!("WARNING: collector data directory is unavailable; persistence writes will fail");
+    } else if !data_dir_explicit || !persistent_storage_declared {
+        eprintln!(
+            "WARNING: durable collector storage is not declared; enrolled devices may be lost after a redeploy"
+        );
+    }
 
     let registry_path = data_dir.join("device-registry.json");
     let registry = std::fs::read_to_string(&registry_path)
@@ -76,6 +103,11 @@ async fn main() {
         raw_summary_path,
         registry: Arc::new(Mutex::new(registry)),
         registry_path,
+        storage_readiness: StorageReadiness {
+            data_dir_explicit,
+            persistent_storage_declared,
+            data_dir_ready,
+        },
     };
 
     let app = Router::new()
@@ -118,8 +150,21 @@ async fn root() -> &'static str {
     "Project Overlord fleet collector — read-only telemetry receiver."
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({ "ok": true, "service": "overlord-collector" }))
+async fn health(State(state): State<AppState>) -> Json<Value> {
+    let durable_storage_configured = state.storage_readiness.data_dir_explicit
+        && state.storage_readiness.persistent_storage_declared
+        && state.storage_readiness.data_dir_ready;
+    Json(json!({
+        "ok": state.storage_readiness.data_dir_ready,
+        "service": "overlord-collector",
+        "storage": {
+            "data_directory_configured": state.storage_readiness.data_dir_explicit,
+            "data_directory_ready": state.storage_readiness.data_dir_ready,
+            "persistent_storage_declared": state.storage_readiness.persistent_storage_declared,
+            "durable_storage_configured": durable_storage_configured,
+            "status": if durable_storage_configured { "persistent" } else { "ephemeral-risk" }
+        }
+    }))
 }
 
 fn provided_ingest_token(headers: &HeaderMap) -> &str {
@@ -202,6 +247,20 @@ fn entry_device_token(entry: &Value) -> Option<String> {
     })
 }
 
+fn registry_registered_at(entry: Option<&Value>) -> Value {
+    entry
+        .and_then(|value| value.get("registered_at"))
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn registry_recovery_bound(entry: Option<&Value>) -> bool {
+    entry
+        .and_then(|value| value.get("recovery_hash"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.is_empty())
+}
+
 /// A recovery token bounds a lost-device-token recovery. Only the SHA-256 of the recovery secret is
 /// ever stored — never the secret itself. Accepts the `ovlrec-` prefix, length-bounded.
 fn recovery_hash_of(recovery_token: Option<&str>) -> Option<String> {
@@ -257,19 +316,44 @@ async fn register_device(
             .into_response();
     }
     let recovery_hash = recovery_hash_of(body.get("recovery_token").and_then(Value::as_str));
+    let now = chrono::Utc::now().to_rfc3339();
     // The tokio Mutex serializes concurrent registrations (no torn read-modify-write).
     let mut registry = state.registry.lock().await;
-    if let Some(existing) = registry.get(&machine_id) {
+    if let Some(existing) = registry.get(&machine_id).cloned() {
         // Existing machine: return the SAME token ONLY when the caller proves the recovery secret
         // (its hash matches what was stored). A shared-secret holder WITHOUT that proof cannot rotate
         // or read another live machine's token — it gets 409. Recovery after a genuine registry reset
         // still works (the id is unbound then).
-        let token = entry_device_token(existing);
-        let stored_hash = existing.get("recovery_hash").and_then(Value::as_str);
+        let token = entry_device_token(&existing);
+        let stored_hash = existing
+            .get("recovery_hash")
+            .and_then(Value::as_str)
+            .map(str::to_string);
         if let (Some(token), Some(provided), Some(stored)) =
-            (token, recovery_hash.as_deref(), stored_hash)
+            (token, recovery_hash.as_deref(), stored_hash.as_deref())
         {
             if provided == stored {
+                let previous = existing;
+                registry.insert(
+                    machine_id.clone(),
+                    json!({
+                        "token": token,
+                        "recovery_hash": stored,
+                        "registered_at": previous
+                            .get("registered_at")
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        "last_recovered_at": now
+                    }),
+                );
+                if let Err(error) = persist_registry(&state.registry_path, &registry) {
+                    registry.insert(machine_id.clone(), previous);
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({ "error": format!("failed to persist recovered registration: {error}") })),
+                    )
+                        .into_response();
+                }
                 return Json(json!({
                     "ok": true,
                     "machine_id": machine_id,
@@ -291,7 +375,12 @@ async fn register_device(
     let device_token = random_device_token();
     registry.insert(
         machine_id.clone(),
-        json!({ "token": device_token, "recovery_hash": recovery_hash }),
+        json!({
+            "token": device_token,
+            "recovery_hash": recovery_hash,
+            "registered_at": now,
+            "last_recovered_at": Value::Null
+        }),
     );
     // Persist atomically; on failure roll back the in-memory insert and report 500, so the endpoint
     // never hands out a token that was not durably stored.
@@ -359,7 +448,19 @@ async fn recovery_bind(
     };
     registry.insert(
         machine_id.clone(),
-        json!({ "token": token, "recovery_hash": recovery_hash }),
+        json!({
+            "token": token,
+            "recovery_hash": recovery_hash,
+            "registered_at": existing
+                .get("registered_at")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "last_recovered_at": existing
+                .get("last_recovered_at")
+                .cloned()
+                .unwrap_or(Value::Null),
+            "recovery_bound_at": chrono::Utc::now().to_rfc3339()
+        }),
     );
     if let Err(error) = persist_registry(&state.registry_path, &registry) {
         return (
@@ -823,6 +924,7 @@ async fn aggregate(State(state): State<AppState>, headers: HeaderMap) -> impl In
 
 fn machine_summary_value(
     machine_id: &str,
+    registry_entry: Option<&Value>,
     digest_entry: Option<&Value>,
     raw_summary: Option<&Value>,
 ) -> Value {
@@ -842,6 +944,22 @@ fn machine_summary_value(
     } else {
         raw_seen
     };
+    let online = chrono::DateTime::parse_from_rfc3339(last_seen)
+        .ok()
+        .map(|seen| {
+            chrono::Utc::now()
+                .signed_duration_since(seen.with_timezone(&chrono::Utc))
+                .num_seconds()
+                <= MACHINE_ONLINE_WINDOW_SECONDS
+        })
+        .unwrap_or(false);
+    let reporting_status = if last_seen.is_empty() {
+        "never-reported"
+    } else if online {
+        "online"
+    } else {
+        "offline"
+    };
     let from_digest_or_raw = |digest_pointer: &str, raw_pointer: &str| {
         digest
             .pointer(digest_pointer)
@@ -856,8 +974,13 @@ fn machine_summary_value(
     let lifecycle = from_digest_or_raw("/lifecycle", "/heartbeat/lifecycle");
     let mut value = json!({
         "machine_id": machine_id,
+        "enrollment_status": if registry_entry.is_some() { "enrolled" } else { "telemetry-without-registration" },
+        "registered_at": registry_registered_at(registry_entry),
+        "recovery_bound": registry_recovery_bound(registry_entry),
+        "reporting_status": reporting_status,
+        "online": online,
         "display_name": from_digest_or_raw("/machine/display_name", "/heartbeat/display_name"),
-        "last_seen_at": last_seen,
+        "last_seen_at": if last_seen.is_empty() { Value::Null } else { json!(last_seen) },
         "provenance": from_digest_or_raw("/provenance", "/provenance"),
         "runtime": from_digest_or_raw("/runtime", "/heartbeat"),
         "latest_scan": from_digest_or_raw("/latest_scan", "/heartbeat/latest_scan"),
@@ -886,11 +1009,13 @@ fn machine_summary_value(
 }
 
 fn machine_summaries(
+    registry: &serde_json::Map<String, Value>,
     digests: &serde_json::Map<String, Value>,
     raw_summaries: &serde_json::Map<String, Value>,
 ) -> Vec<Value> {
-    let mut ids = digests
+    let mut ids = registry
         .keys()
+        .chain(digests.keys())
         .chain(raw_summaries.keys())
         .cloned()
         .collect::<Vec<_>>();
@@ -901,6 +1026,7 @@ fn machine_summaries(
         .map(|machine_id| {
             machine_summary_value(
                 machine_id,
+                registry.get(machine_id),
                 digests.get(machine_id),
                 raw_summaries.get(machine_id),
             )
@@ -924,12 +1050,43 @@ async fn machine_list(State(state): State<AppState>, headers: HeaderMap) -> impl
     if let Err(response) = require_enroll_secret(&state, &headers) {
         return response;
     }
+    let registry = state.registry.lock().await;
     let digests = state.digests.lock().await;
     let raw_summaries = state.raw_summaries.lock().await;
-    let machines = machine_summaries(&digests, &raw_summaries);
+    let machines = machine_summaries(&registry, &digests, &raw_summaries);
+    let machines_online = machines
+        .iter()
+        .filter(|machine| machine.get("online") == Some(&json!(true)))
+        .count();
+    let machines_reporting = machines
+        .iter()
+        .filter(|machine| {
+            machine
+                .get("last_seen_at")
+                .is_some_and(|value| !value.is_null())
+        })
+        .count();
+    let machines_never_reported = machines
+        .iter()
+        .filter(|machine| {
+            machine.get("enrollment_status") == Some(&json!("enrolled"))
+                && machine.get("reporting_status") == Some(&json!("never-reported"))
+        })
+        .count();
+    let machines_offline = machines
+        .iter()
+        .filter(|machine| {
+            machine.get("enrollment_status") == Some(&json!("enrolled"))
+                && machine.get("online") == Some(&json!(false))
+        })
+        .count();
     Json(json!({
-        "schema": "overlord.fleet.machine-list.v1",
-        "machines_reporting": machines.len(),
+        "schema": "overlord.fleet.machine-list.v2",
+        "machines_enrolled": registry.len(),
+        "machines_reporting": machines_reporting,
+        "machines_online": machines_online,
+        "machines_offline": machines_offline,
+        "machines_never_reported": machines_never_reported,
         "machines": machines,
         "generated_at": chrono::Utc::now().to_rfc3339(),
         "read_only": true,
@@ -948,9 +1105,13 @@ async fn machine_detail(
     if let Err(response) = require_enroll_secret(&state, &headers) {
         return response;
     }
+    let registry = state.registry.lock().await;
     let digests = state.digests.lock().await;
     let raw_summaries = state.raw_summaries.lock().await;
-    if !digests.contains_key(&machine_id) && !raw_summaries.contains_key(&machine_id) {
+    if !registry.contains_key(&machine_id)
+        && !digests.contains_key(&machine_id)
+        && !raw_summaries.contains_key(&machine_id)
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "machine not found" })),
@@ -959,6 +1120,7 @@ async fn machine_detail(
     }
     Json(machine_summary_value(
         &machine_id,
+        registry.get(&machine_id),
         digests.get(&machine_id),
         raw_summaries.get(&machine_id),
     ))
@@ -973,9 +1135,13 @@ async fn machine_timeline(
     if let Err(response) = require_enroll_secret(&state, &headers) {
         return response;
     }
+    let registry = state.registry.lock().await;
     let digests = state.digests.lock().await;
     let raw_summaries = state.raw_summaries.lock().await;
-    if !digests.contains_key(&machine_id) && !raw_summaries.contains_key(&machine_id) {
+    if !registry.contains_key(&machine_id)
+        && !digests.contains_key(&machine_id)
+        && !raw_summaries.contains_key(&machine_id)
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "machine not found" })),
@@ -984,6 +1150,7 @@ async fn machine_timeline(
     }
     let summary = machine_summary_value(
         &machine_id,
+        registry.get(&machine_id),
         digests.get(&machine_id),
         raw_summaries.get(&machine_id),
     );
@@ -1044,14 +1211,73 @@ mod observability_tests {
                 "verdicts": { "malicious": 0 }
             }
         });
-        let summary = machine_summary_value("machine-1", Some(&digest), None);
+        let registry = json!({
+            "token": "secret-device-token",
+            "recovery_hash": "secret-recovery-hash",
+            "registered_at": "2026-08-15T11:00:00Z"
+        });
+        let summary = machine_summary_value("machine-1", Some(&registry), Some(&digest), None);
         assert_eq!(summary.get("display_name"), Some(&json!("FIELD-PC")));
         assert_eq!(
             summary.pointer("/provenance/version"),
             Some(&json!("0.2.25"))
         );
         assert_eq!(summary.pointer("/update/status"), Some(&json!("succeeded")));
+        assert_eq!(summary.get("enrollment_status"), Some(&json!("enrolled")));
+        assert_eq!(summary.get("recovery_bound"), Some(&json!(true)));
+        assert!(summary.get("token").is_none());
+        assert!(summary.get("recovery_hash").is_none());
         assert_eq!(summary.get("hands_tied"), Some(&json!(true)));
         assert_eq!(summary.get("remote_commands_enabled"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn machine_ledger_keeps_enrolled_devices_without_telemetry() {
+        let registry = serde_json::Map::from_iter([(
+            "machine-offline".to_string(),
+            json!({
+                "token": "secret-device-token",
+                "recovery_hash": "secret-recovery-hash",
+                "registered_at": "2026-08-15T11:00:00Z"
+            }),
+        )]);
+        let machines =
+            machine_summaries(&registry, &serde_json::Map::new(), &serde_json::Map::new());
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0]["machine_id"], json!("machine-offline"));
+        assert_eq!(machines[0]["reporting_status"], json!("never-reported"));
+        assert_eq!(machines[0]["online"], json!(false));
+        assert_eq!(machines[0]["registered_at"], json!("2026-08-15T11:00:00Z"));
+        assert!(machines[0].get("token").is_none());
+        assert!(machines[0].get("recovery_hash").is_none());
+    }
+
+    #[test]
+    fn registry_survives_a_storage_reload() {
+        let unique = format!(
+            "overlord-collector-registry-{}-{}.json",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        );
+        let path = std::env::temp_dir().join(unique);
+        let registry = serde_json::Map::from_iter([(
+            "machine-restart".to_string(),
+            json!({
+                "token": "secret-device-token",
+                "recovery_hash": "secret-recovery-hash",
+                "registered_at": "2026-08-15T11:00:00Z"
+            }),
+        )]);
+
+        persist_registry(&path, &registry).expect("persist registry");
+        let reloaded = load_json_map(&path);
+        let machines =
+            machine_summaries(&reloaded, &serde_json::Map::new(), &serde_json::Map::new());
+
+        assert_eq!(machines.len(), 1);
+        assert_eq!(machines[0]["machine_id"], json!("machine-restart"));
+        assert_eq!(machines[0]["enrollment_status"], json!("enrolled"));
+        assert_eq!(machines[0]["reporting_status"], json!("never-reported"));
+        let _ = std::fs::remove_file(path);
     }
 }
